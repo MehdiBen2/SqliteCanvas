@@ -304,10 +304,11 @@ class EnhancedGraphicsView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self._panning and self._last_mouse_pos is not None:
             delta = event.position() - self._last_mouse_pos
+            # Convert float values to integers for scrollbar
             self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - delta.x())
+                self.horizontalScrollBar().value() - int(delta.x()))
             self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - delta.y())
+                self.verticalScrollBar().value() - int(delta.y()))
             self._last_mouse_pos = event.position()
             event.accept()
         else:
@@ -591,28 +592,33 @@ class EditTableDialog(QDialog):
         if not self.db or not self.table_name:
             return
             
-        cursor = self.db.cursor()
-        
-        # Get column info
-        cursor.execute(f"PRAGMA table_info({self.table_name})")
-        self.columns = cursor.fetchall()
-        
-        # Set up table widget
-        self.table_widget.setColumnCount(len(self.columns))
-        headers = [col[1] for col in self.columns]
-        self.table_widget.setHorizontalHeaderLabels(headers)
-        
-        # Get table data
-        cursor.execute(f"SELECT * FROM {self.table_name}")
-        data = cursor.fetchall()
-        
-        self.table_widget.setRowCount(len(data))
-        for i, row in enumerate(data):
-            for j, value in enumerate(row):
-                item = QTableWidgetItem(str(value))
-                self.table_widget.setItem(i, j, item)
-                
-        self.table_widget.resizeColumnsToContents()
+        try:
+            cursor = self.db.cursor()
+            
+            # Get column info
+            cursor.execute(f'PRAGMA table_info("{self.table_name}")')
+            self.columns = cursor.fetchall()
+            
+            # Set up table widget
+            self.table_widget.setColumnCount(len(self.columns))
+            headers = [col[1] for col in self.columns]
+            self.table_widget.setHorizontalHeaderLabels(headers)
+            
+            # Get table data
+            cursor.execute(f'SELECT * FROM "{self.table_name}"')
+            data = cursor.fetchall()
+            
+            self.table_widget.setRowCount(len(data))
+            for i, row in enumerate(data):
+                for j, value in enumerate(row):
+                    item = QTableWidgetItem(str(value))
+                    self.table_widget.setItem(i, j, item)
+                    
+            self.table_widget.resizeColumnsToContents()
+            
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Failed to load table data: {str(e)}")
+            self.reject()
         
     def add_row(self):
         row = self.table_widget.rowCount()
@@ -631,11 +637,11 @@ class EditTableDialog(QDialog):
             cursor = self.db.cursor()
             
             # Get current data
-            cursor.execute(f"SELECT * FROM {self.table_name}")
+            cursor.execute(f'SELECT * FROM "{self.table_name}"')
             old_data = cursor.fetchall()
             
             # Delete all rows
-            cursor.execute(f"DELETE FROM {self.table_name}")
+            cursor.execute(f'DELETE FROM "{self.table_name}"')
             
             # Insert new data
             for row in range(self.table_widget.rowCount()):
@@ -646,7 +652,7 @@ class EditTableDialog(QDialog):
                     
                 placeholders = ",".join(["?" for _ in values])
                 cursor.execute(
-                    f"INSERT INTO {self.table_name} VALUES ({placeholders})",
+                    f'INSERT INTO "{self.table_name}" VALUES ({placeholders})',
                     values
                 )
                 
@@ -657,11 +663,18 @@ class EditTableDialog(QDialog):
             self.db.rollback()
             QMessageBox.critical(self, "Error", f"Failed to save changes: {str(e)}")
             # Restore old data
-            cursor.executemany(
-                f"INSERT INTO {self.table_name} VALUES ({','.join(['?' for _ in old_data[0]])})",
-                old_data
-            )
-            self.db.commit()
+            try:
+                cursor.execute(f'DELETE FROM "{self.table_name}"')
+                placeholders = ",".join(["?" for _ in old_data[0]])
+                cursor.executemany(
+                    f'INSERT INTO "{self.table_name}" VALUES ({placeholders})',
+                    old_data
+                )
+                self.db.commit()
+            except sqlite3.Error as restore_error:
+                QMessageBox.critical(self, "Error", 
+                    f"Failed to restore data: {str(restore_error)}\n"
+                    "Please check the table data manually.")
 
 class DatabaseViewer(QMainWindow):
     def __init__(self):
@@ -1196,15 +1209,34 @@ class DatabaseViewer(QMainWindow):
         # Get the current table if one is selected
         current_table = None
         if self.table_widget.rowCount() > 0:
-            header_text = self.table_widget.horizontalHeaderItem(0).text()
-            # Extract table name without PK/FK indicators and type info
-            current_table = header_text.split('(')[0].strip()  # Remove type info
-            if current_table.startswith('🔑 '):  # Remove PK indicator
-                current_table = current_table[2:].strip()
-            elif current_table.startswith('🔗 '):  # Remove FK indicator
-                current_table = current_table[2:].strip()
+            # Get all column headers and find the table name from any of them
+            for col in range(self.table_widget.columnCount()):
+                header_text = self.table_widget.horizontalHeaderItem(col).text()
+                # Extract base column name without type info
+                base_name = header_text.split('(')[0].strip()
+                # If it's a PK or FK column, remove the indicator
+                if base_name.startswith('🔑 '):
+                    base_name = base_name[2:].strip()
+                elif base_name.startswith('🔗 '):
+                    base_name = base_name[2:].strip()
+                
+                # Get the table name from PRAGMA table_info
+                cursor = self.current_db.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cursor.fetchall()]
+                
+                # Find the table that contains this column
+                for table in tables:
+                    cursor.execute(f'PRAGMA table_info("{table}")')
+                    columns = cursor.fetchall()
+                    if any(col[1] == base_name for col in columns):
+                        current_table = table
+                        break
+                
+                if current_table:
+                    break
             
-        # If no table is selected, show a dialog to choose one
+        # If no table is selected or found, show a dialog to choose one
         if not current_table:
             tables = self.get_all_tables()
             if not tables:
