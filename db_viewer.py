@@ -382,8 +382,11 @@ class EnhancedTableWidget(QTableWidget):
 class TableColumnWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)  # Changed to VBox for better organization
         layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Top row with basic column info
+        top_row = QHBoxLayout()
         
         self.name = QLineEdit()
         self.name.setPlaceholderText("Column Name")
@@ -395,25 +398,97 @@ class TableColumnWidget(QWidget):
         self.nullable = QCheckBox("Nullable")
         self.nullable.setChecked(True)
         
+        top_row.addWidget(self.name)
+        top_row.addWidget(self.type)
+        top_row.addWidget(self.pk)
+        top_row.addWidget(self.nullable)
+        layout.addLayout(top_row)
+        
+        # Bottom row with foreign key info
+        fk_row = QHBoxLayout()
+        
         self.fk = QCheckBox("Foreign Key")
-        self.fk_table = QComboBox()
-        self.fk_table.setEnabled(False)
-        self.fk_column = QComboBox()
-        self.fk_column.setEnabled(False)
+        self.fk_info = QComboBox()
+        self.fk_info.setEnabled(False)
+        self.fk_info.setMinimumWidth(300)  # Make it wider to show more info
+        self.fk_info.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {Colors.CARD_BACKGROUND};
+                color: {Colors.TEXT_PRIMARY};
+                padding: 5px;
+                border: 1px solid {Colors.PRIMARY};
+                border-radius: 4px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 5px solid {Colors.PRIMARY};
+                width: 0;
+            }}
+        """)
         
-        layout.addWidget(self.name)
-        layout.addWidget(self.type)
-        layout.addWidget(self.pk)
-        layout.addWidget(self.nullable)
-        layout.addWidget(self.fk)
-        layout.addWidget(self.fk_table)
-        layout.addWidget(self.fk_column)
+        fk_row.addWidget(self.fk)
+        fk_row.addWidget(self.fk_info)
+        fk_row.addStretch()
+        layout.addLayout(fk_row)
         
+        # Hidden storage for actual reference values
+        self.fk_table = QLineEdit(self)
+        self.fk_column = QLineEdit(self)
+        self.fk_table.hide()
+        self.fk_column.hide()
+        
+        # Connect signals
         self.fk.stateChanged.connect(self.toggle_fk_controls)
+        self.fk_info.currentTextChanged.connect(self.update_fk_reference)
+        self.pk.toggled.connect(self.on_pk_toggled)
         
     def toggle_fk_controls(self, state):
-        self.fk_table.setEnabled(state == Qt.CheckState.Checked)
-        self.fk_column.setEnabled(state == Qt.CheckState.Checked)
+        self.fk_info.setEnabled(state == Qt.CheckState.Checked)
+        if not state == Qt.CheckState.Checked:
+            self.fk_info.setCurrentIndex(-1)
+            self.fk_table.clear()
+            self.fk_column.clear()
+            
+    def update_fk_reference(self, text):
+        if text:
+            # Format is "Table.Column (Type) [PK]"
+            table_col = text.split(" (")[0]  # Get "Table.Column" part
+            table, column = table_col.split(".")
+            self.fk_table.setText(table)
+            self.fk_column.setText(column)
+            
+            # Update type to match referenced column if possible
+            type_str = text.split(" (")[1].split(")")[0]
+            idx = self.type.findText(type_str)
+            if idx >= 0:
+                self.type.setCurrentIndex(idx)
+                
+    def on_pk_toggled(self, checked):
+        """When PK is checked, disable FK and uncheck it"""
+        if checked:
+            self.fk.setChecked(False)
+            self.fk.setEnabled(False)
+        else:
+            self.fk.setEnabled(True)
+            
+    def set_available_references(self, references):
+        """Set available foreign key references in format [('table', 'column', 'type', is_pk)]"""
+        current = self.fk_info.currentText()
+        self.fk_info.clear()
+        
+        for table, column, type_str, is_pk in references:
+            display_text = f"{table}.{column} ({type_str})"
+            if is_pk:
+                display_text += " [PK]"
+            self.fk_info.addItem(display_text)
+            
+        if current:
+            idx = self.fk_info.findText(current)
+            if idx >= 0:
+                self.fk_info.setCurrentIndex(idx)
 
 class CreateTableDialog(QDialog):
     def __init__(self, parent=None, db=None):
@@ -421,6 +496,10 @@ class CreateTableDialog(QDialog):
         self.db = db
         self.setWindowTitle("Create New Table")
         self.setMinimumWidth(800)
+        
+        # Initialize available_references before adding any columns
+        self.available_references = []
+        self.update_available_references()
         
         layout = QVBoxLayout(self)
         
@@ -458,46 +537,43 @@ class CreateTableDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
         
-        self.update_fk_tables()
-        
     def add_column(self):
         column = TableColumnWidget(self)
         self.columns_layout.addWidget(column)
-        self.update_fk_tables()
+        column.set_available_references(self.available_references)
         
-    def update_fk_tables(self):
+    def update_available_references(self):
+        """Get all available columns that can be referenced (primary keys and unique columns)"""
         if not self.db:
             return
             
+        self.available_references = []
         cursor = self.db.cursor()
+        
+        # Get all tables
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall()]
         
+        # Get column info for each table
+        for table in tables:
+            cursor.execute(f'PRAGMA table_info("{table}")')
+            columns = cursor.fetchall()
+            
+            # Add primary keys and unique columns
+            for col in columns:
+                name = col[1]
+                type_str = col[2]
+                is_pk = bool(col[5])
+                
+                if is_pk:  # Always include primary keys
+                    self.available_references.append((table, name, type_str, True))
+                    
+        # Update all existing columns with the new references
         for i in range(self.columns_layout.count()):
             widget = self.columns_layout.itemAt(i).widget()
             if isinstance(widget, TableColumnWidget):
-                current_table = widget.fk_table.currentText()
-                widget.fk_table.clear()
-                widget.fk_table.addItems(tables)
-                if current_table in tables:
-                    widget.fk_table.setCurrentText(current_table)
-                widget.fk_table.currentTextChanged.connect(
-                    lambda t, w=widget: self.update_fk_columns(w))
+                widget.set_available_references(self.available_references)
                 
-    def update_fk_columns(self, column_widget):
-        if not self.db or not column_widget.fk_table.currentText():
-            return
-            
-        cursor = self.db.cursor()
-        cursor.execute(f"PRAGMA table_info({column_widget.fk_table.currentText()})")
-        columns = [row[1] for row in cursor.fetchall()]
-        
-        current_column = column_widget.fk_column.currentText()
-        column_widget.fk_column.clear()
-        column_widget.fk_column.addItems(columns)
-        if current_column in columns:
-            column_widget.fk_column.setCurrentText(current_column)
-            
     def create_table(self):
         if not self.table_name.text():
             QMessageBox.warning(self, "Error", "Please enter a table name")
@@ -528,11 +604,11 @@ class CreateTableDialog(QDialog):
                 columns.append(" ".join(col_def))
                 
                 # Add foreign key constraint if needed
-                if widget.fk.isChecked():
+                if widget.fk.isChecked() and widget.fk_table.text() and widget.fk_column.text():
                     constraints.append(
                         f'FOREIGN KEY ("{widget.name.text()}") '
-                        f'REFERENCES "{widget.fk_table.currentText()}" '
-                        f'("{widget.fk_column.currentText()}")'
+                        f'REFERENCES "{widget.fk_table.text()}" '
+                        f'("{widget.fk_column.text()}")'
                     )
         
         if not columns:
