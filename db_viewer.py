@@ -497,10 +497,6 @@ class CreateTableDialog(QDialog):
         self.setWindowTitle("Create New Table")
         self.setMinimumWidth(800)
         
-        # Initialize available_references before adding any columns
-        self.available_references = []
-        self.update_available_references()
-        
         layout = QVBoxLayout(self)
         
         # Table name
@@ -519,9 +515,6 @@ class CreateTableDialog(QDialog):
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         
-        # Add initial column
-        self.add_column()
-        
         # Buttons
         btn_layout = QHBoxLayout()
         add_col_btn = ModernButton("Add Column")
@@ -536,6 +529,11 @@ class CreateTableDialog(QDialog):
         btn_layout.addWidget(create_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
+        
+        # Initialize available_references and add first column after UI is set up
+        self.available_references = []
+        self.update_available_references()
+        self.add_column()  # Add initial column after everything is initialized
         
     def add_column(self):
         column = TableColumnWidget(self)
