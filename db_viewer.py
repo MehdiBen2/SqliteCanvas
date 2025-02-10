@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QGraphicsScene, QGraphicsView, QGraphicsItem,
                             QGraphicsRectItem, QGraphicsTextItem, QMenu,
                             QComboBox, QHeaderView, QToolTip, QStyledItemDelegate,
-                            QStyle, QLineEdit)
+                            QStyle, QLineEdit, QDialog, QFormLayout, QSpinBox,
+                            QCheckBox, QMessageBox, QScrollArea)
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (QPen, QBrush, QColor, QPainter, QFont, QCursor,
                         QPainterPath, QPolygonF, QWheelEvent, QPalette)
@@ -259,6 +260,10 @@ class EnhancedGraphicsView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         
+        # Initialize panning attributes
+        self._panning = False
+        self._last_mouse_pos = None
+        
     def wheelEvent(self, event: QWheelEvent):
         # Zoom Factor
         zoom_factor = 1.15
@@ -278,6 +283,35 @@ class EnhancedGraphicsView(QGraphicsView):
         # Move scene to old position
         delta = new_pos - old_pos
         self.translate(delta.x(), delta.y())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._last_mouse_pos = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+            
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+            
+    def mouseMoveEvent(self, event):
+        if self._panning and self._last_mouse_pos is not None:
+            delta = event.position() - self._last_mouse_pos
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y())
+            self._last_mouse_pos = event.position()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
 class RelationshipDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
@@ -343,6 +377,291 @@ class EnhancedTableWidget(QTableWidget):
                     QToolTip.showText(event.globalPosition().toPoint(), 
                                     f"Foreign Key\nReferences: {rel['ref_table']}.{rel['ref_column']}")
         super().mouseMoveEvent(event)
+
+class TableColumnWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("Column Name")
+        
+        self.type = QComboBox()
+        self.type.addItems(["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"])
+        
+        self.pk = QCheckBox("Primary Key")
+        self.nullable = QCheckBox("Nullable")
+        self.nullable.setChecked(True)
+        
+        self.fk = QCheckBox("Foreign Key")
+        self.fk_table = QComboBox()
+        self.fk_table.setEnabled(False)
+        self.fk_column = QComboBox()
+        self.fk_column.setEnabled(False)
+        
+        layout.addWidget(self.name)
+        layout.addWidget(self.type)
+        layout.addWidget(self.pk)
+        layout.addWidget(self.nullable)
+        layout.addWidget(self.fk)
+        layout.addWidget(self.fk_table)
+        layout.addWidget(self.fk_column)
+        
+        self.fk.stateChanged.connect(self.toggle_fk_controls)
+        
+    def toggle_fk_controls(self, state):
+        self.fk_table.setEnabled(state == Qt.CheckState.Checked)
+        self.fk_column.setEnabled(state == Qt.CheckState.Checked)
+
+class CreateTableDialog(QDialog):
+    def __init__(self, parent=None, db=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Create New Table")
+        self.setMinimumWidth(800)
+        
+        layout = QVBoxLayout(self)
+        
+        # Table name
+        name_layout = QHBoxLayout()
+        self.table_name = QLineEdit()
+        self.table_name.setPlaceholderText("Table Name")
+        name_layout.addWidget(QLabel("Table Name:"))
+        name_layout.addWidget(self.table_name)
+        layout.addLayout(name_layout)
+        
+        # Columns scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        self.columns_layout = QVBoxLayout(scroll_widget)
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        # Add initial column
+        self.add_column()
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        add_col_btn = ModernButton("Add Column")
+        add_col_btn.clicked.connect(self.add_column)
+        create_btn = ModernButton("Create Table")
+        create_btn.clicked.connect(self.create_table)
+        cancel_btn = ModernButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(add_col_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(create_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        self.update_fk_tables()
+        
+    def add_column(self):
+        column = TableColumnWidget(self)
+        self.columns_layout.addWidget(column)
+        self.update_fk_tables()
+        
+    def update_fk_tables(self):
+        if not self.db:
+            return
+            
+        cursor = self.db.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        
+        for i in range(self.columns_layout.count()):
+            widget = self.columns_layout.itemAt(i).widget()
+            if isinstance(widget, TableColumnWidget):
+                current_table = widget.fk_table.currentText()
+                widget.fk_table.clear()
+                widget.fk_table.addItems(tables)
+                if current_table in tables:
+                    widget.fk_table.setCurrentText(current_table)
+                widget.fk_table.currentTextChanged.connect(
+                    lambda t, w=widget: self.update_fk_columns(w))
+                
+    def update_fk_columns(self, column_widget):
+        if not self.db or not column_widget.fk_table.currentText():
+            return
+            
+        cursor = self.db.cursor()
+        cursor.execute(f"PRAGMA table_info({column_widget.fk_table.currentText()})")
+        columns = [row[1] for row in cursor.fetchall()]
+        
+        current_column = column_widget.fk_column.currentText()
+        column_widget.fk_column.clear()
+        column_widget.fk_column.addItems(columns)
+        if current_column in columns:
+            column_widget.fk_column.setCurrentText(current_column)
+            
+    def create_table(self):
+        if not self.table_name.text():
+            QMessageBox.warning(self, "Error", "Please enter a table name")
+            return
+            
+        columns = []
+        constraints = []
+        
+        for i in range(self.columns_layout.count()):
+            widget = self.columns_layout.itemAt(i).widget()
+            if isinstance(widget, TableColumnWidget):
+                if not widget.name.text():
+                    QMessageBox.warning(self, "Error", 
+                                      f"Please enter a name for column {i+1}")
+                    return
+                    
+                # Build column definition
+                col_def = [
+                    f'"{widget.name.text()}"',
+                    widget.type.currentText()
+                ]
+                
+                if widget.pk.isChecked():
+                    col_def.append("PRIMARY KEY")
+                if not widget.nullable.isChecked():
+                    col_def.append("NOT NULL")
+                    
+                columns.append(" ".join(col_def))
+                
+                # Add foreign key constraint if needed
+                if widget.fk.isChecked():
+                    constraints.append(
+                        f'FOREIGN KEY ("{widget.name.text()}") '
+                        f'REFERENCES "{widget.fk_table.currentText()}" '
+                        f'("{widget.fk_column.currentText()}")'
+                    )
+        
+        if not columns:
+            QMessageBox.warning(self, "Error", "Please add at least one column")
+            return
+            
+        # Create the table
+        try:
+            cursor = self.db.cursor()
+            query = f'CREATE TABLE "{self.table_name.text()}" (\n'
+            query += ",\n".join(columns)
+            if constraints:
+                query += ",\n" + ",\n".join(constraints)
+            query += "\n)"
+            
+            cursor.execute(query)
+            self.db.commit()
+            self.accept()
+            
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Failed to create table: {str(e)}")
+
+class EditTableDialog(QDialog):
+    def __init__(self, parent=None, db=None, table_name=None):
+        super().__init__(parent)
+        self.db = db
+        self.table_name = table_name
+        self.setWindowTitle(f"Edit Table: {table_name}")
+        self.setMinimumWidth(800)
+        
+        layout = QVBoxLayout(self)
+        
+        # Create the table widget
+        self.table_widget = QTableWidget()
+        self.table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_widget.customContextMenuRequested.connect(self.show_context_menu)
+        layout.addWidget(self.table_widget)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        add_row_btn = ModernButton("Add Row")
+        add_row_btn.clicked.connect(self.add_row)
+        save_btn = ModernButton("Save Changes")
+        save_btn.clicked.connect(self.save_changes)
+        cancel_btn = ModernButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(add_row_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        self.load_table_data()
+        
+    def load_table_data(self):
+        if not self.db or not self.table_name:
+            return
+            
+        cursor = self.db.cursor()
+        
+        # Get column info
+        cursor.execute(f"PRAGMA table_info({self.table_name})")
+        self.columns = cursor.fetchall()
+        
+        # Set up table widget
+        self.table_widget.setColumnCount(len(self.columns))
+        headers = [col[1] for col in self.columns]
+        self.table_widget.setHorizontalHeaderLabels(headers)
+        
+        # Get table data
+        cursor.execute(f"SELECT * FROM {self.table_name}")
+        data = cursor.fetchall()
+        
+        self.table_widget.setRowCount(len(data))
+        for i, row in enumerate(data):
+            for j, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                self.table_widget.setItem(i, j, item)
+                
+        self.table_widget.resizeColumnsToContents()
+        
+    def add_row(self):
+        row = self.table_widget.rowCount()
+        self.table_widget.insertRow(row)
+        
+    def show_context_menu(self, pos):
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Row")
+        action = menu.exec(self.table_widget.viewport().mapToGlobal(pos))
+        
+        if action == delete_action:
+            self.table_widget.removeRow(self.table_widget.rowAt(pos.y()))
+            
+    def save_changes(self):
+        try:
+            cursor = self.db.cursor()
+            
+            # Get current data
+            cursor.execute(f"SELECT * FROM {self.table_name}")
+            old_data = cursor.fetchall()
+            
+            # Delete all rows
+            cursor.execute(f"DELETE FROM {self.table_name}")
+            
+            # Insert new data
+            for row in range(self.table_widget.rowCount()):
+                values = []
+                for col in range(self.table_widget.columnCount()):
+                    item = self.table_widget.item(row, col)
+                    values.append(item.text() if item else None)
+                    
+                placeholders = ",".join(["?" for _ in values])
+                cursor.execute(
+                    f"INSERT INTO {self.table_name} VALUES ({placeholders})",
+                    values
+                )
+                
+            self.db.commit()
+            self.accept()
+            
+        except sqlite3.Error as e:
+            self.db.rollback()
+            QMessageBox.critical(self, "Error", f"Failed to save changes: {str(e)}")
+            # Restore old data
+            cursor.executemany(
+                f"INSERT INTO {self.table_name} VALUES ({','.join(['?' for _ in old_data[0]])})",
+                old_data
+            )
+            self.db.commit()
 
 class DatabaseViewer(QMainWindow):
     def __init__(self):
@@ -423,6 +742,17 @@ class DatabaseViewer(QMainWindow):
         self.open_btn = ModernButton("Open Database")
         self.open_btn.clicked.connect(self.open_database)
         db_controls.addWidget(self.open_btn)
+        
+        # Add create and edit table buttons
+        self.create_table_btn = ModernButton("Create Table")
+        self.create_table_btn.clicked.connect(self.create_table)
+        self.create_table_btn.setEnabled(False)
+        db_controls.addWidget(self.create_table_btn)
+        
+        self.edit_table_btn = ModernButton("Edit Table")
+        self.edit_table_btn.clicked.connect(self.edit_table)
+        self.edit_table_btn.setEnabled(False)
+        db_controls.addWidget(self.edit_table_btn)
         
         # Add search box
         search_layout = QHBoxLayout()
@@ -586,6 +916,8 @@ class DatabaseViewer(QMainWindow):
             try:
                 self.current_db = sqlite3.connect(file_name)
                 self.status_label.setText(f"Connected to: {file_name}")
+                self.create_table_btn.setEnabled(True)
+                self.edit_table_btn.setEnabled(True)
                 self.load_tables()
                 self.visualize_relationships()
             except sqlite3.Error as e:
@@ -702,7 +1034,7 @@ class DatabaseViewer(QMainWindow):
             else:
                 header_text = col_name
             
-            headers.append(header_text)
+            headers.append(f"{header_text} ({col_type})")
         
         self.table_widget.setHorizontalHeaderLabels(headers)
         
@@ -728,11 +1060,11 @@ class DatabaseViewer(QMainWindow):
                 if j in self.table_widget.relationships:
                     rel = self.table_widget.relationships[j]
                     if rel['type'] == 'pk':
-                        item.setBackground(QColor(Colors.PK_BACKGROUND))  # Darker gold for PK
-                        item.setForeground(QColor(Colors.TEXT_PRIMARY))  # White text
+                        item.setBackground(QColor(Colors.PK_BACKGROUND))
+                        item.setForeground(QColor(Colors.TEXT_PRIMARY))
                     elif rel['type'] == 'fk':
-                        item.setBackground(QColor(Colors.FK_BACKGROUND))  # Darker blue for FK
-                        item.setForeground(QColor(Colors.TEXT_PRIMARY))  # White text
+                        item.setBackground(QColor(Colors.FK_BACKGROUND))
+                        item.setForeground(QColor(Colors.TEXT_PRIMARY))
                 
                 self.table_widget.setItem(i, j, item)
         
@@ -847,6 +1179,66 @@ class DatabaseViewer(QMainWindow):
                         row_visible = True
                         break
                 self.table_widget.setRowHidden(row, not row_visible)
+
+    def create_table(self):
+        if not self.current_db:
+            return
+            
+        dialog = CreateTableDialog(self, self.current_db)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.load_tables()
+            self.visualize_relationships()
+            
+    def edit_table(self):
+        if not self.current_db:
+            return
+            
+        # Get the current table if one is selected
+        current_table = None
+        if self.table_widget.rowCount() > 0:
+            header_text = self.table_widget.horizontalHeaderItem(0).text()
+            # Extract table name without PK/FK indicators and type info
+            current_table = header_text.split('(')[0].strip()  # Remove type info
+            if current_table.startswith('🔑 '):  # Remove PK indicator
+                current_table = current_table[2:].strip()
+            elif current_table.startswith('🔗 '):  # Remove FK indicator
+                current_table = current_table[2:].strip()
+            
+        # If no table is selected, show a dialog to choose one
+        if not current_table:
+            tables = self.get_all_tables()
+            if not tables:
+                QMessageBox.warning(self, "Error", "No tables available to edit")
+                return
+                
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select Table")
+            layout = QVBoxLayout(dialog)
+            
+            combo = QComboBox()
+            combo.addItems(tables)
+            layout.addWidget(QLabel("Select table to edit:"))
+            layout.addWidget(combo)
+            
+            btn_layout = QHBoxLayout()
+            ok_btn = ModernButton("OK")
+            ok_btn.clicked.connect(dialog.accept)
+            cancel_btn = ModernButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            layout.addLayout(btn_layout)
+            
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                current_table = combo.currentText()
+            else:
+                return
+                
+        # Open the edit dialog
+        dialog = EditTableDialog(self, self.current_db, current_table)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.show_table_content(current_table)
+            self.visualize_relationships()
 
 def main():
     app = QApplication(sys.argv)
